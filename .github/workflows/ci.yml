@@ -11,7 +11,7 @@ on:
       node_count:
         description: 'Parallel Browsers'
         required: true
-        default: '10'
+        default: '2'
 
 jobs:
   automation:

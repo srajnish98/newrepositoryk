@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       node_count:
-        description: 'Number of Chrome Nodes to scale'
+        description: 'Number of Chrome Nodes and Parallel Threads'
         required: true
         default: '2'
 
@@ -34,8 +34,8 @@ jobs:
 
       - name: Deploy Selenium Grid
         run: |
-          # Determine replica count (use input if manual, otherwise default to 1)
-          REPLICAS=${{ github.event.inputs.node_count || 1 }}
+          # Use manual input or default to 2
+          REPLICAS=${{ github.event.inputs.node_count || 2 }}
           echo "Scaling Chrome Nodes to: $REPLICAS"
 
           cat <<EOF | kubectl apply -f -
@@ -102,23 +102,21 @@ jobs:
                     medium: Memory
           EOF
 
-      - name: Wait for Selenium Infrastructure
+      - name: Wait for Infrastructure
         run: |
           kubectl wait --for=condition=Ready pod -l app=selenium-hub --timeout=120s
-          # Wait for all replicas to be ready
           kubectl rollout status deployment/selenium-node-chrome --timeout=120s
           
       - name: Start Port-Forwarding
         run: |
           kubectl port-forward service/selenium-hub 4444:4444 > /dev/null 2>&1 &
-          echo "Checking Grid health..."
           timeout 60s bash -c 'until curl -s http://localhost:4444/status | grep "\"ready\": true"; do sleep 5; done'
-          
-          # This line logs how many nodes actually registered to the hub
-          curl -s http://localhost:4444/status | jq '.value.nodes | length' || echo "Nodes registered"
+          echo "Grid is Online!"
 
-      - name: Run Maven Tests
-        run: mvn test
+      - name: Run Maven Tests in Parallel
+        run: |
+          # We pass the node_count input into the Maven threadCount property
+          mvn test -Dparallel=methods -DthreadCount=${{ github.event.inputs.node_count || 2 }}
         env:
           SELENIUM_REMOTE_URL: http://localhost:4444/wd/hub
 
@@ -126,5 +124,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: parallel-test-results
+          name: execution-reports
           path: target/surefire-reports/

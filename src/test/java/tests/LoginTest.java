@@ -14,7 +14,7 @@ public class LoginTest {
         caps.setBrowserName("chrome");
 
         WebDriver driver = new RemoteWebDriver(
-                new URL("http://selenium-hub:4444/wd/hub"), caps);
+                new URL("http://localhost:4444/wd/hub"), caps);
 
         driver.get("https://www.google.com");
         System.out.println(driver.getTitle());

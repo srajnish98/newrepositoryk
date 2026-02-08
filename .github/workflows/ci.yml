@@ -1,4 +1,4 @@
-name: Selenium Auto-Scaling (XML Based)
+name: Selenium Auto-Scaling (Final Stable)
 
 on:
   workflow_dispatch:
@@ -18,31 +18,32 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 1. FIX: MODERN KIND SETUP
+      # 1. NEW STABLE KIND SETUP
       - name: Setup K8s (Kind)
-        uses: engineerd/setup-kind@v0.6.0
+        uses: helm/kind-action@v1.10.0
         with:
-          version: "v0.24.0"
+          version: v0.24.0
+          cluster_name: kind
 
-      # 2. DYNAMIC XML SCANNER
+      # 2. XML SCANNER (Counts <test> tags)
       - name: Calculate Required Nodes
         id: scanner
         run: |
-          # Finds the XML in the project and counts <test> tags
+          # Find the XML file path dynamically
           XML_PATH=$(find . -name "${{ github.event.inputs.suite_name }}" | head -n 1)
-          TEST_COUNT=$(grep -c "<test " $XML_PATH || echo 2)
-          
-          # Safety Cap for GitHub Runner RAM
-          if [ "$TEST_COUNT" -gt 12 ]; then
-            FINAL_COUNT=12
+          if [ -z "$XML_PATH" ]; then
+            echo "nodes=2" >> $GITHUB_OUTPUT
+            echo "msg=XML not found. Defaulting to 2."
           else
-            FINAL_COUNT=$TEST_COUNT
+            TEST_COUNT=$(grep -c "<test " $XML_PATH || echo 2)
+            # Cap at 10 browsers for stability on 7GB RAM runners
+            [ "$TEST_COUNT" -gt 10 ] && FINAL=10 || FINAL=$TEST_COUNT
+            echo "nodes=$FINAL" >> $GITHUB_OUTPUT
+            echo "msg=Found $TEST_COUNT tests. Scaling to $FINAL nodes."
           fi
-          echo "nodes=$FINAL_COUNT" >> $GITHUB_OUTPUT
-          echo "Using $FINAL_COUNT nodes for suite."
 
       # 3. DEPLOY GRID
-      - name: Deploy Dynamic Grid
+      - name: Deploy Selenium
         run: |
           REPLICAS=${{ steps.scanner.outputs.nodes }}
           cat <<EOF | kubectl apply -f -
@@ -63,18 +64,14 @@ jobs:
                 containers:
                 - name: selenium-hub
                   image: selenium/hub:4.16.1
-                  ports:
-                    - containerPort: 4444
           ---
           apiVersion: v1
           kind: Service
           metadata:
             name: selenium-hub
           spec:
-            ports:
-              - port: 4444
-            selector:
-              app: selenium-hub
+            ports: [ {port: 4444} ]
+            selector: {app: selenium-hub}
           ---
           apiVersion: apps/v1
           kind: Deployment
@@ -105,32 +102,28 @@ jobs:
                     name: dshm
                 volumes:
                 - name: dshm
-                  emptyDir:
-                    medium: Memory
-                    sizeLimit: "2Gi"
+                  emptyDir: {medium: Memory, sizeLimit: "2Gi"}
           EOF
 
-      # 4. MONITOR & RUN
-      - name: Port Forward & Live Monitor
+      # 4. HEALTH CHECK & TEST
+      - name: Run Tests
         run: |
-          kubectl rollout status deployment/selenium-node-chrome --timeout=180s
+          kubectl rollout status deployment/selenium-node-chrome --timeout=120s
           kubectl port-forward service/selenium-hub 4444:4444 > /dev/null 2>&1 &
           
-          # Background health monitor
-          (while true; do 
-            curl -s http://localhost:4444/status | jq -r '.value.nodes[] | "Node \(.id): Busy=\(.slots[0].session != null)"'
-            sleep 30
-          done) &
-
+          # Wait for Grid Status "Ready"
+          timeout 60s bash -c 'until curl -s http://localhost:4444/status | grep "\"ready\": true"; do sleep 5; done'
+          
           mvn test -DsuiteXmlFile=${{ github.event.inputs.suite_name }} \
                    -DthreadCount=${{ steps.scanner.outputs.nodes }} \
                    -Dsurefire.rerunFailingTestsCount=1
         env:
           SELENIUM_REMOTE_URL: http://localhost:4444/wd/hub
 
-      # 5. CLEANUP
-      - name: Final Cleanup
+      # 5. AUTO-CLEANUP (Always runs)
+      - name: Cleanup
         if: always()
         run: |
           sudo killall kubectl || true
-          kind delete cluster || true
+          # helm/kind-action creates a cluster named 'kind' by default
+          kind delete cluster --name kind || true

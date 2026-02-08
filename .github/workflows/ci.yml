@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       node_count:
-        description: 'Number of Chrome Nodes and Parallel Threads'
+        description: 'Number of Chrome Nodes to scale'
         required: true
         default: '2'
 
@@ -34,7 +34,7 @@ jobs:
 
       - name: Deploy Selenium Grid
         run: |
-          # Use manual input or default to 2
+          # Use manual input if provided, else default to 2
           REPLICAS=${{ github.event.inputs.node_count || 2 }}
           echo "Scaling Chrome Nodes to: $REPLICAS"
 
@@ -93,6 +93,7 @@ jobs:
                     value: "4442"
                   - name: SE_EVENT_BUS_SUBSCRIBE_PORT
                     value: "4443"
+                  # This replaces shm-size and fixes your error
                   volumeMounts:
                   - mountPath: /dev/shm
                     name: dshm
@@ -109,14 +110,16 @@ jobs:
           
       - name: Start Port-Forwarding
         run: |
+          # The '&' runs this in the background
           kubectl port-forward service/selenium-hub 4444:4444 > /dev/null 2>&1 &
+          
+          # Health check loop
+          echo "Waiting for Grid to be ready..."
           timeout 60s bash -c 'until curl -s http://localhost:4444/status | grep "\"ready\": true"; do sleep 5; done'
           echo "Grid is Online!"
 
-      - name: Run Maven Tests in Parallel
-        run: |
-          # We pass the node_count input into the Maven threadCount property
-          mvn test -Dparallel=methods -DthreadCount=${{ github.event.inputs.node_count || 2 }}
+      - name: Run Maven Tests
+        run: mvn test -DthreadCount=${{ github.event.inputs.node_count || 2 }}
         env:
           SELENIUM_REMOTE_URL: http://localhost:4444/wd/hub
 
@@ -124,5 +127,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: execution-reports
+          name: test-results
           path: target/surefire-reports/

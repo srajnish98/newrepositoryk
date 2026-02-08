@@ -1,10 +1,16 @@
-name: Selenium Automation in K8s
+name: Selenium Kubernetes Automation
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
-  test:
+  automation-testing:
     runs-on: ubuntu-latest
+    
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -16,34 +22,94 @@ jobs:
           distribution: 'temurin'
           cache: maven
 
-      - name: Create K8s Cluster (Kind)
+      - name: Create Kind Cluster
         uses: engineerd/setup-kind@v0.5.0
         with:
           version: "v0.19.0"
 
       - name: Deploy Selenium Grid to K8s
         run: |
-          kubectl apply -f k8s/selenium-grid.yaml
-          # Wait for the hub to be ready
-          kubectl wait --for=condition=available deployment/selenium-hub --timeout=60s
-          kubectl wait --for=condition=available deployment/selenium-node-chrome --timeout=60s
+          # Creating the deployment directly via heredoc to keep it in one file
+          cat <<EOF | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: selenium-hub
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: selenium-hub
+            template:
+              metadata:
+                labels:
+                  app: selenium-hub
+              spec:
+                containers:
+                - name: selenium-hub
+                  image: selenium/hub:4.16.1
+                  ports:
+                    - containerPort: 4444
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: selenium-hub
+          spec:
+            ports:
+              - port: 4444
+            selector:
+              app: selenium-hub
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: selenium-node-chrome
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: selenium-node-chrome
+            template:
+              metadata:
+                labels:
+                  app: selenium-node-chrome
+              spec:
+                containers:
+                - name: selenium-node-chrome
+                  image: selenium/node-chrome:4.16.1
+                  shm-size: "2g"
+                  env:
+                  - name: SE_EVENT_BUS_HOST
+                    value: selenium-hub
+                  - name: SE_EVENT_BUS_PUBLISH_PORT
+                    value: "4442"
+                  - name: SE_EVENT_BUS_SUBSCRIBE_PORT
+                    value: "4443"
+          EOF
 
-      - name: Port Forward Selenium Hub
+      - name: Wait for Selenium Infrastructure
         run: |
-          # Run in background so the next steps can execute
-          kubectl port-forward service/selenium-hub 4444:4444 &
-          # Give it a few seconds to establish the tunnel
-          sleep 5
+          echo "Waiting for pods to be ready..."
+          kubectl wait --for=condition=Ready pod -l app=selenium-hub --timeout=120s
+          kubectl wait --for=condition=Ready pod -l app=selenium-node-chrome --timeout=120s
+          
+      - name: Start Port-Forwarding
+        run: |
+          # This connects the Runner's localhost:4444 to the K8s Service
+          kubectl port-forward service/selenium-hub 4444:4444 > /dev/null 2>&1 &
+          
+          # Wait for the tunnel to establish and Hub to be ready for sessions
+          timeout 30s bash -c 'until curl -s http://localhost:4444/status | grep "\"ready\": true"; do sleep 2; done'
+          echo "Selenium Grid is Ready!"
 
-      - name: Run Selenium Tests
+      - name: Run Maven Tests
         run: mvn test
-        env:
-          # If your code uses environment variables for the URL
-          SELENIUM_GRID_URL: http://localhost:4444/wd/hub
+        # Ensure your LoginTest.java uses: new RemoteWebDriver(new URL("http://localhost:4444/wd/hub"), options);
 
-      - name: Upload Test Reports
+      - name: Upload Reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: surefire-reports
+          name: test-results
           path: target/surefire-reports/

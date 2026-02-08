@@ -1,4 +1,4 @@
-name: Selenium Sanity & Regression (Final Version)
+name: Selenium Auto-Scaling (XML Based)
 
 on:
   workflow_dispatch:
@@ -7,11 +7,9 @@ on:
         description: 'Choose Suite'
         required: true
         type: choice
-        options: [sanity-suites.xml, regression-suites.xml]
-      node_count:
-        description: 'Parallel Browsers'
-        required: true
-        default: '2'
+        options:
+          - sanity-suites.xml
+          - regression-suites.xml
 
 jobs:
   automation:
@@ -20,47 +18,119 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Infrastructure
-        uses: engineerd/setup-kind@v0.5.0
+      # 1. FIX: MODERN KIND SETUP
+      - name: Setup K8s (Kind)
+        uses: engineerd/setup-kind@v0.6.0
+        with:
+          version: "v0.24.0"
 
-      - name: Deploy High-Performance Grid
+      # 2. DYNAMIC XML SCANNER
+      - name: Calculate Required Nodes
+        id: scanner
         run: |
-          REPLICAS=${{ github.event.inputs.node_count }}
-          # (Deployment YAML remains the same as previous step)
-          # Ensure SE_NODE_MAX_SESSIONS: 1 and SE_DRAIN_AFTER_SESSION_COUNT: 1 are set
+          # Finds the XML in the project and counts <test> tags
+          XML_PATH=$(find . -name "${{ github.event.inputs.suite_name }}" | head -n 1)
+          TEST_COUNT=$(grep -c "<test " $XML_PATH || echo 2)
+          
+          # Safety Cap for GitHub Runner RAM
+          if [ "$TEST_COUNT" -gt 12 ]; then
+            FINAL_COUNT=12
+          else
+            FINAL_COUNT=$TEST_COUNT
+          fi
+          echo "nodes=$FINAL_COUNT" >> $GITHUB_OUTPUT
+          echo "Using $FINAL_COUNT nodes for suite."
 
+      # 3. DEPLOY GRID
+      - name: Deploy Dynamic Grid
+        run: |
+          REPLICAS=${{ steps.scanner.outputs.nodes }}
+          cat <<EOF | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: selenium-hub
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: selenium-hub
+            template:
+              metadata:
+                labels:
+                  app: selenium-hub
+              spec:
+                containers:
+                - name: selenium-hub
+                  image: selenium/hub:4.16.1
+                  ports:
+                    - containerPort: 4444
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: selenium-hub
+          spec:
+            ports:
+              - port: 4444
+            selector:
+              app: selenium-hub
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: selenium-node-chrome
+          spec:
+            replicas: $REPLICAS
+            selector:
+              matchLabels:
+                app: selenium-node-chrome
+            template:
+              metadata:
+                labels:
+                  app: selenium-node-chrome
+              spec:
+                containers:
+                - name: selenium-node-chrome
+                  image: selenium/node-chrome:130.0
+                  env:
+                  - name: SE_EVENT_BUS_HOST
+                    value: selenium-hub
+                  - name: SE_HUB_HOST
+                    value: selenium-hub
+                  - name: SE_NODE_MAX_SESSIONS
+                    value: "1"
+                  volumeMounts:
+                  - mountPath: /dev/shm
+                    name: dshm
+                volumes:
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: "2Gi"
+          EOF
+
+      # 4. MONITOR & RUN
       - name: Port Forward & Live Monitor
         run: |
+          kubectl rollout status deployment/selenium-node-chrome --timeout=180s
           kubectl port-forward service/selenium-hub 4444:4444 > /dev/null 2>&1 &
-          timeout 60s bash -c 'until curl -s http://localhost:4444/status | grep "\"ready\": true"; do sleep 5; done'
           
-          # Background monitoring of Node Busy/Idle status
+          # Background health monitor
           (while true; do 
-            echo "--- NODE USAGE ---"
             curl -s http://localhost:4444/status | jq -r '.value.nodes[] | "Node \(.id): Busy=\(.slots[0].session != null)"'
-            sleep 20
+            sleep 30
           done) &
 
-      - name: Run Tests with Auto-Retry
-        run: |
           mvn test -DsuiteXmlFile=${{ github.event.inputs.suite_name }} \
-                   -DthreadCount=${{ github.event.inputs.node_count }} \
+                   -DthreadCount=${{ steps.scanner.outputs.nodes }} \
                    -Dsurefire.rerunFailingTestsCount=1
         env:
           SELENIUM_REMOTE_URL: http://localhost:4444/wd/hub
 
-      - name: Upload Test Evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: automation-evidence
-          path: |
-            target/surefire-reports/
-            target/screenshots/
-          retention-days: 7
-
-      - name: Cleanup
+      # 5. CLEANUP
+      - name: Final Cleanup
         if: always()
         run: |
           sudo killall kubectl || true
-          kind delete cluster --name chart-testing || true
+          kind delete cluster || true

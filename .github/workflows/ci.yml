@@ -1,47 +1,39 @@
-name: Selenium Kubernetes Tests
+name: Selenium Grid via Helm
 
 on:
-  push:
-    branches: [ "main" ]
-  workflow_dispatch:    
+  workflow_dispatch:
 
 jobs:
-  test:
+  selenium-tests:
     runs-on: ubuntu-latest
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Login to DockerHub
-      uses: docker/login-action@v3
-      with:
-        username: ${{ secrets.DOCKER_USERNAME }}
-        password: ${{ secrets.DOCKER_PASSWORD }}
+    - name: Install Helm
+      uses: azure/setup-helm@v4
 
-    - name: Build and Push Docker Image
-      run: |
-        docker build -t ${{ secrets.DOCKER_USERNAME }}/selenium-tests:latest .
-        docker push ${{ secrets.DOCKER_USERNAME }}/selenium-tests:latest
-
-    - name: Setup kubectl
+    - name: Setup kubeconfig
       run: |
         mkdir -p $HOME/.kube
         echo "${{ secrets.KUBE_CONFIG }}" | base64 --decode > $HOME/.kube/config
 
-    - name: Deploy Selenium Grid
+    - name: Add Selenium Helm Repo
       run: |
-        kubectl apply -f k8s/selenium-grid.yaml
+        helm repo add selenium https://www.selenium.dev/docker-selenium
+        helm repo update
 
-    - name: Run Selenium Tests
+    - name: Install Selenium Grid
       run: |
-        kubectl delete job selenium-test-job --ignore-not-found
-        kubectl apply -f k8s/test-runner-job.yaml
+        helm upgrade --install selenium-grid selenium/selenium-grid \
+          --set chromeNode.replicas=3
 
-    - name: Wait for Job Completion
+    - name: Wait for Selenium Grid
       run: |
-        kubectl wait --for=condition=complete job/selenium-test-job --timeout=300s
+        kubectl rollout status deployment/selenium-grid-selenium-hub --timeout=300s
 
-    - name: Show Logs
+    - name: Verify Pods
       run: |
-        kubectl logs job/selenium-test-job
+        kubectl get pods
+        kubectl get svc

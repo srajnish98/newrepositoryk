@@ -108,15 +108,32 @@ jobs:
           kubectl wait --for=condition=Ready pod -l app=selenium-hub --timeout=120s
           kubectl rollout status deployment/selenium-node-chrome --timeout=120s
           
-      - name: Start Port-Forwarding
-        run: |
-          # The '&' runs this in the background
-          kubectl port-forward service/selenium-hub 4444:4444 > /dev/null 2>&1 &
+      - name: Start Port-Forwarding and Check Status
+       run: |
+          # 1. Start Port-forward in background
+          kubectl port-forward service/selenium-hub 4444:4444 > port-forward.log 2>&1 &
           
-          # Health check loop
-          echo "Waiting for Grid to be ready..."
-          timeout 60s bash -c 'until curl -s http://localhost:4444/status | grep "\"ready\": true"; do sleep 5; done'
-          echo "Grid is Online!"
+          # 2. Wait for the local port to actually open
+          echo "Waiting for local port 4444 to open..."
+          timeout 30s bash -c 'until nc -z localhost 4444; do sleep 2; done'
+          
+          # 3. Wait for the Selenium Hub to see at least one Node
+          echo "Waiting for Selenium Grid to report 'ready: true'..."
+          # Increased timeout to 90s to give Nodes time to register
+          timeout 90s bash -c 'until curl -s http://localhost:4444/status | grep "\"ready\": true"; do 
+            echo "Grid not ready yet... checking status..."
+            curl -s http://localhost:4444/status | jq .value.ready || echo "Hub starting..."
+            sleep 5
+          done'
+          
+          echo "Grid is Online and Node is registered!"
+
+      - name: Run Maven Tests
+        run: |
+          # Added -e and -X for better debugging if it fails again
+          mvn test -Dparallel=methods -DthreadCount=${{ github.event.inputs.node_count || 2 }}
+        env:
+          SELENIUM_REMOTE_URL: http://localhost:4444/wd/hub
 
       - name: Run Maven Tests
         run: mvn test -DthreadCount=${{ github.event.inputs.node_count || 2 }}

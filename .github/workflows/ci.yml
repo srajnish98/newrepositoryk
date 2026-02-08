@@ -1,4 +1,4 @@
-name: Selenium Auto-Scaling (Final Stable)
+name: Selenium Auto-Scaling (Production Stable)
 
 on:
   workflow_dispatch:
@@ -18,32 +18,30 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 1. NEW STABLE KIND SETUP
+      # 1. MODERN STABLE KIND SETUP (Fixes the json5/engineerd error)
       - name: Setup K8s (Kind)
         uses: helm/kind-action@v1.10.0
         with:
           version: v0.24.0
           cluster_name: kind
 
-      # 2. XML SCANNER (Counts <test> tags)
+      # 2. DYNAMIC XML SCANNER (Calculates browser count based on your XML)
       - name: Calculate Required Nodes
         id: scanner
         run: |
-          # Find the XML file path dynamically
           XML_PATH=$(find . -name "${{ github.event.inputs.suite_name }}" | head -n 1)
           if [ -z "$XML_PATH" ]; then
             echo "nodes=2" >> $GITHUB_OUTPUT
-            echo "msg=XML not found. Defaulting to 2."
           else
+            # Count <test> tags and cap at 10 for GitHub Runner stability
             TEST_COUNT=$(grep -c "<test " $XML_PATH || echo 2)
-            # Cap at 10 browsers for stability on 7GB RAM runners
             [ "$TEST_COUNT" -gt 10 ] && FINAL=10 || FINAL=$TEST_COUNT
             echo "nodes=$FINAL" >> $GITHUB_OUTPUT
-            echo "msg=Found $TEST_COUNT tests. Scaling to $FINAL nodes."
+            echo "Dynamic Scaling: Using $FINAL nodes for $TEST_COUNT tests."
           fi
 
-      # 3. DEPLOY GRID
-      - name: Deploy Selenium
+      # 3. DEPLOY HIGH-PERFORMANCE GRID
+      - name: Deploy Selenium Infrastructure
         run: |
           REPLICAS=${{ steps.scanner.outputs.nodes }}
           cat <<EOF | kubectl apply -f -
@@ -64,6 +62,10 @@ jobs:
                 containers:
                 - name: selenium-hub
                   image: selenium/hub:4.16.1
+                  resources:
+                    requests:
+                      cpu: "500m"
+                      memory: "512Mi"
           ---
           apiVersion: v1
           kind: Service
@@ -97,6 +99,10 @@ jobs:
                     value: selenium-hub
                   - name: SE_NODE_MAX_SESSIONS
                     value: "1"
+                  - name: SE_NODE_SESSION_TIMEOUT
+                    value: "30"
+                  - name: SE_DRAIN_AFTER_SESSION_COUNT
+                    value: "1"
                   volumeMounts:
                   - mountPath: /dev/shm
                     name: dshm
@@ -105,25 +111,42 @@ jobs:
                   emptyDir: {medium: Memory, sizeLimit: "2Gi"}
           EOF
 
-      # 4. HEALTH CHECK & TEST
-      - name: Run Tests
+      # 4. ROBUST TEST EXECUTION (Fixes Exit Code 124)
+      - name: Run Automation
         run: |
-          kubectl rollout status deployment/selenium-node-chrome --timeout=120s
-          kubectl port-forward service/selenium-hub 4444:4444 > /dev/null 2>&1 &
+          echo "Waiting for pods to stabilize..."
+          kubectl rollout status deployment/selenium-node-chrome --timeout=180s
           
-          # Wait for Grid Status "Ready"
-          timeout 60s bash -c 'until curl -s http://localhost:4444/status | grep "\"ready\": true"; do sleep 5; done'
+          echo "Establishing Grid Tunnel..."
+          kubectl port-forward service/selenium-hub 4444:4444 > pf.log 2>&1 &
           
+          echo "Waiting for Selenium Grid Health API..."
+          # 120s timeout ensures we don't crash before the handshake completes
+          timeout 120s bash -c 'until curl -s http://localhost:4444/status | grep "\"ready\": true"; do 
+            echo "Waiting for nodes to register..."
+            sleep 5
+          done'
+          
+          echo "Grid is ONLINE. Starting Maven..."
           mvn test -DsuiteXmlFile=${{ github.event.inputs.suite_name }} \
                    -DthreadCount=${{ steps.scanner.outputs.nodes }} \
                    -Dsurefire.rerunFailingTestsCount=1
         env:
           SELENIUM_REMOTE_URL: http://localhost:4444/wd/hub
 
-      # 5. AUTO-CLEANUP (Always runs)
-      - name: Cleanup
+      # 5. EVIDENCE COLLECTION & CLEANUP
+      - name: Upload Evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.suite_name }}-results
+          path: |
+            target/surefire-reports/
+            target/screenshots/
+            pf.log
+
+      - name: Cleanup Environment
         if: always()
         run: |
           sudo killall kubectl || true
-          # helm/kind-action creates a cluster named 'kind' by default
           kind delete cluster --name kind || true

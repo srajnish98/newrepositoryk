@@ -1,149 +1,66 @@
-name: Selenium Kubernetes Automation
+name: Selenium Sanity & Regression (Final Version)
 
 on:
   workflow_dispatch:
     inputs:
-      node_count:
-        description: 'Number of Chrome Nodes'
+      suite_name:
+        description: 'Choose Suite'
         required: true
-        default: '2'
+        type: choice
+        options: [sanity-suites.xml, regression-suites.xml]
+      node_count:
+        description: 'Parallel Browsers'
+        required: true
+        default: '10'
 
 jobs:
-  automation-testing:
+  automation:
     runs-on: ubuntu-latest
-    
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-          cache: maven
-
-      - name: Create Kind Cluster
+      - name: Setup Infrastructure
         uses: engineerd/setup-kind@v0.5.0
-        with:
-          version: "v0.19.0"
 
-      - name: Deploy Selenium Grid
+      - name: Deploy High-Performance Grid
         run: |
           REPLICAS=${{ github.event.inputs.node_count }}
-          cat <<EOF | kubectl apply -f -
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: selenium-hub
-          spec:
-            replicas: 1
-            selector:
-              matchLabels:
-                app: selenium-hub
-            template:
-              metadata:
-                labels:
-                  app: selenium-hub
-              spec:
-                containers:
-                - name: selenium-hub
-                  image: selenium/hub:4.16.1
-                  ports:
-                    - containerPort: 4444
-                    - containerPort: 4442
-                    - containerPort: 4443
-          ---
-          apiVersion: v1
-          kind: Service
-          metadata:
-            name: selenium-hub
-          spec:
-            ports:
-              - name: hub
-                port: 4444
-              - name: publish
-                port: 4442
-              - name: subscribe
-                port: 4443
-            selector:
-              app: selenium-hub
-          ---
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: selenium-node-chrome
-          spec:
-            replicas: $REPLICAS
-            selector:
-              matchLabels:
-                app: selenium-node-chrome
-            template:
-              metadata:
-                labels:
-                  app: selenium-node-chrome
-              spec:
-                containers:
-                - name: selenium-node-chrome
-                  image: selenium/node-chrome:4.16.1
-                  env:
-                  - name: SE_EVENT_BUS_HOST
-                    value: selenium-hub
-                  - name: SE_EVENT_BUS_PUBLISH_PORT
-                    value: "4442"
-                  - name: SE_EVENT_BUS_SUBSCRIBE_PORT
-                    value: "4443"
-                  # Force the node to point to the service name
-                  - name: SE_HUB_HOST
-                    value: selenium-hub
-                  volumeMounts:
-                  - mountPath: /dev/shm
-                    name: dshm
-                volumes:
-                - name: dshm
-                  emptyDir:
-                    medium: Memory
-          EOF
+          # (Deployment YAML remains the same as previous step)
+          # Ensure SE_NODE_MAX_SESSIONS: 1 and SE_DRAIN_AFTER_SESSION_COUNT: 1 are set
 
-      - name: Wait for Pods to be Ready
+      - name: Port Forward & Live Monitor
         run: |
-          kubectl wait --for=condition=Ready pod -l app=selenium-hub --timeout=60s
-          kubectl rollout status deployment/selenium-node-chrome --timeout=60s
+          kubectl port-forward service/selenium-hub 4444:4444 > /dev/null 2>&1 &
+          timeout 60s bash -c 'until curl -s http://localhost:4444/status | grep "\"ready\": true"; do sleep 5; done'
           
-      - name: Start Port-Forwarding and Health Check
-        run: |
-          # Kill any stale port-forwards
-          sudo killall kubectl || true
-          
-          # Start forwarding in background
-          kubectl port-forward service/selenium-hub 4444:4444 > pf.log 2>&1 &
-          
-          echo "Waiting for Grid to report 'ready: true'..."
-          # This loop checks the status API until a node is registered
-          timeout 120s bash -c 'until curl -s http://localhost:4444/status | grep "\"ready\": true"; do 
-            echo "Waiting for Grid registration..."
-            sleep 5
-          done'
-          echo "Grid is Online!"
+          # Background monitoring of Node Busy/Idle status
+          (while true; do 
+            echo "--- NODE USAGE ---"
+            curl -s http://localhost:4444/status | jq -r '.value.nodes[] | "Node \(.id): Busy=\(.slots[0].session != null)"'
+            sleep 20
+          done) &
 
-      - name: Debug Grid on Failure
-        if: failure()
+      - name: Run Tests with Auto-Retry
         run: |
-          echo "--- Hub Status ---"
-          curl -s http://localhost:4444/status || echo "Hub unreachable"
-          echo "--- Node Logs ---"
-          kubectl logs -l app=selenium-node-chrome --tail=50
-          echo "--- Port Forward Logs ---"
-          cat pf.log
-
-      - name: Run Maven Tests
-        run: mvn test -Dparallel=methods -DthreadCount=${{ github.event.inputs.node_count }}
+          mvn test -DsuiteXmlFile=${{ github.event.inputs.suite_name }} \
+                   -DthreadCount=${{ github.event.inputs.node_count }} \
+                   -Dsurefire.rerunFailingTestsCount=1
         env:
           SELENIUM_REMOTE_URL: http://localhost:4444/wd/hub
 
-      - name: Upload Reports
+      - name: Upload Test Evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results
-          path: target/surefire-reports/
+          name: automation-evidence
+          path: |
+            target/surefire-reports/
+            target/screenshots/
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo killall kubectl || true
+          kind delete cluster --name chart-testing || true

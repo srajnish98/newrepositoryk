@@ -49,17 +49,19 @@
 					<artifactId>maven-surefire-plugin</artifactId>
 					<version>3.2.5</version>
 					<configuration>
+						<suiteXmlFiles>
+							<suiteXmlFile>${suiteXmlFile}</suiteXmlFile>
+						</suiteXmlFiles>
 						<properties>
 							<property>
 								<name>parallel</name>
-								<value>${parallel}</value>
+								<value>methods</value>
 							</property>
 							<property>
 								<name>dataproviderthreadcount</name>
 								<value>${threadCount}</value>
 							</property>
 						</properties>
-						<threadCount>${threadCount}</threadCount>
 					</configuration>
 				</plugin>
 			</plugins>

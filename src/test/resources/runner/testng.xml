@@ -1,7 +1,11 @@
-<suite name="Suite" parallel="methods" thread-count="2">
-    <test name="Test">
-        <classes>
-            <class name="tests.LoginTest"/>
-        </classes>
-    </test>
+<suite name="Dynamic Suite" parallel="methods"
+	thread-count="${threadCount}">
+	<listeners>
+		<listener class-name="tests.RetryListener" />
+	</listeners>
+	<test name="Test">
+		<classes>
+			<class name="tests.LoginTest" />
+		</classes>
+	</test>
 </suite>

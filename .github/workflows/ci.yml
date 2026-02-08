@@ -1,4 +1,4 @@
-name: Selenium Auto-Scaling (Production Stable)
+name: Selenium Auto-Scaling (Fixed Networking)
 
 on:
   workflow_dispatch:
@@ -18,14 +18,12 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 1. MODERN STABLE KIND SETUP (Fixes the json5/engineerd error)
       - name: Setup K8s (Kind)
         uses: helm/kind-action@v1.10.0
         with:
           version: v0.24.0
           cluster_name: kind
 
-      # 2. DYNAMIC XML SCANNER (Calculates browser count based on your XML)
       - name: Calculate Required Nodes
         id: scanner
         run: |
@@ -33,14 +31,11 @@ jobs:
           if [ -z "$XML_PATH" ]; then
             echo "nodes=2" >> $GITHUB_OUTPUT
           else
-            # Count <test> tags and cap at 10 for GitHub Runner stability
             TEST_COUNT=$(grep -c "<test " $XML_PATH || echo 2)
             [ "$TEST_COUNT" -gt 10 ] && FINAL=10 || FINAL=$TEST_COUNT
             echo "nodes=$FINAL" >> $GITHUB_OUTPUT
-            echo "Dynamic Scaling: Using $FINAL nodes for $TEST_COUNT tests."
           fi
 
-      # 3. DEPLOY HIGH-PERFORMANCE GRID
       - name: Deploy Selenium Infrastructure
         run: |
           REPLICAS=${{ steps.scanner.outputs.nodes }}
@@ -62,18 +57,25 @@ jobs:
                 containers:
                 - name: selenium-hub
                   image: selenium/hub:4.16.1
-                  resources:
-                    requests:
-                      cpu: "500m"
-                      memory: "512Mi"
+                  ports:
+                    - containerPort: 4444
+                    - containerPort: 4442
+                    - containerPort: 4443
           ---
           apiVersion: v1
           kind: Service
           metadata:
             name: selenium-hub
           spec:
-            ports: [ {port: 4444} ]
-            selector: {app: selenium-hub}
+            ports:
+              - name: hub
+                port: 4444
+              - name: bus-publish
+                port: 4442
+              - name: bus-subscribe
+                port: 4443
+            selector:
+              app: selenium-hub
           ---
           apiVersion: apps/v1
           kind: Deployment
@@ -95,13 +97,13 @@ jobs:
                   env:
                   - name: SE_EVENT_BUS_HOST
                     value: selenium-hub
+                  - name: SE_EVENT_BUS_PUBLISH_PORT
+                    value: "4442"
+                  - name: SE_EVENT_BUS_SUBSCRIBE_PORT
+                    value: "4443"
                   - name: SE_HUB_HOST
                     value: selenium-hub
                   - name: SE_NODE_MAX_SESSIONS
-                    value: "1"
-                  - name: SE_NODE_SESSION_TIMEOUT
-                    value: "30"
-                  - name: SE_DRAIN_AFTER_SESSION_COUNT
                     value: "1"
                   volumeMounts:
                   - mountPath: /dev/shm
@@ -111,7 +113,6 @@ jobs:
                   emptyDir: {medium: Memory, sizeLimit: "2Gi"}
           EOF
 
-      # 4. ROBUST TEST EXECUTION (Fixes Exit Code 124)
       - name: Run Automation
         run: |
           echo "Waiting for pods to stabilize..."
@@ -121,31 +122,23 @@ jobs:
           kubectl port-forward service/selenium-hub 4444:4444 > pf.log 2>&1 &
           
           echo "Waiting for Selenium Grid Health API..."
-          # 120s timeout ensures we don't crash before the handshake completes
           timeout 120s bash -c 'until curl -s http://localhost:4444/status | grep "\"ready\": true"; do 
-            echo "Waiting for nodes to register..."
+            echo "Waiting for nodes to register with Hub..."
             sleep 5
-          done'
+          done' || (
+            echo "!!! Registration Failed - Checking Logs !!!"
+            kubectl logs -l app=selenium-hub --tail=50
+            kubectl logs -l app=selenium-node-chrome --tail=50
+            exit 1
+          )
           
-          echo "Grid is ONLINE. Starting Maven..."
           mvn test -DsuiteXmlFile=${{ github.event.inputs.suite_name }} \
                    -DthreadCount=${{ steps.scanner.outputs.nodes }} \
                    -Dsurefire.rerunFailingTestsCount=1
         env:
           SELENIUM_REMOTE_URL: http://localhost:4444/wd/hub
 
-      # 5. EVIDENCE COLLECTION & CLEANUP
-      - name: Upload Evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ github.event.inputs.suite_name }}-results
-          path: |
-            target/surefire-reports/
-            target/screenshots/
-            pf.log
-
-      - name: Cleanup Environment
+      - name: Cleanup
         if: always()
         run: |
           sudo killall kubectl || true

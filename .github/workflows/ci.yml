@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      node_count:
+        description: 'Number of Chrome Nodes to scale'
+        required: true
+        default: '2'
 
 jobs:
   automation-testing:
@@ -27,9 +32,12 @@ jobs:
         with:
           version: "v0.19.0"
 
-      - name: Deploy Selenium Grid to K8s
+      - name: Deploy Selenium Grid
         run: |
-          # Creating the deployment directly via heredoc to keep it in one file
+          # Determine replica count (use input if manual, otherwise default to 1)
+          REPLICAS=${{ github.event.inputs.node_count || 1 }}
+          echo "Scaling Chrome Nodes to: $REPLICAS"
+
           cat <<EOF | kubectl apply -f -
           apiVersion: apps/v1
           kind: Deployment
@@ -66,7 +74,7 @@ jobs:
           metadata:
             name: selenium-node-chrome
           spec:
-            replicas: 1
+            replicas: $REPLICAS
             selector:
               matchLabels:
                 app: selenium-node-chrome
@@ -78,7 +86,6 @@ jobs:
                 containers:
                 - name: selenium-node-chrome
                   image: selenium/node-chrome:4.16.1
-                  shm-size: "2g"
                   env:
                   - name: SE_EVENT_BUS_HOST
                     value: selenium-hub
@@ -86,30 +93,38 @@ jobs:
                     value: "4442"
                   - name: SE_EVENT_BUS_SUBSCRIBE_PORT
                     value: "4443"
+                  volumeMounts:
+                  - mountPath: /dev/shm
+                    name: dshm
+                volumes:
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
           EOF
 
       - name: Wait for Selenium Infrastructure
         run: |
-          echo "Waiting for pods to be ready..."
           kubectl wait --for=condition=Ready pod -l app=selenium-hub --timeout=120s
-          kubectl wait --for=condition=Ready pod -l app=selenium-node-chrome --timeout=120s
+          # Wait for all replicas to be ready
+          kubectl rollout status deployment/selenium-node-chrome --timeout=120s
           
       - name: Start Port-Forwarding
         run: |
-          # This connects the Runner's localhost:4444 to the K8s Service
           kubectl port-forward service/selenium-hub 4444:4444 > /dev/null 2>&1 &
+          echo "Checking Grid health..."
+          timeout 60s bash -c 'until curl -s http://localhost:4444/status | grep "\"ready\": true"; do sleep 5; done'
           
-          # Wait for the tunnel to establish and Hub to be ready for sessions
-          timeout 30s bash -c 'until curl -s http://localhost:4444/status | grep "\"ready\": true"; do sleep 2; done'
-          echo "Selenium Grid is Ready!"
+          # This line logs how many nodes actually registered to the hub
+          curl -s http://localhost:4444/status | jq '.value.nodes | length' || echo "Nodes registered"
 
       - name: Run Maven Tests
         run: mvn test
-        # Ensure your LoginTest.java uses: new RemoteWebDriver(new URL("http://localhost:4444/wd/hub"), options);
+        env:
+          SELENIUM_REMOTE_URL: http://localhost:4444/wd/hub
 
       - name: Upload Reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results
+          name: parallel-test-results
           path: target/surefire-reports/
